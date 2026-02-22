@@ -286,24 +286,47 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
     error_count = sum(1 for r in results if r["status"] == "error")
 
     summary_message = (
-        f"Validation complete!\n"
-        f"  Valid:   {valid_count}\n"
-        f"  Invalid: {invalid_count}\n"
-        f"  Errors:  {error_count}\n"
+        f"✨ Validation complete! ✨\n\n"
+        f"✅ Valid:   {valid_count}\n"
+        f"❌ Invalid: {invalid_count}\n"
+        f"⚠️ Errors:  {error_count}\n\n"
     )
+
+    valid_results = [r for r in results if r["status"] == "valid"]
+    if valid_results:
+        # Sort valid results by plan and then by total_with_refresh credits (descending)
+        valid_results.sort(key=lambda x: (x.get("plan", ""), x.get("total_with_refresh", 0)), reverse=True)
+
+        summary_message += "--- Valid Cookies Details ---\n"
+        summary_table = []
+        for r in valid_results:
+            summary_table.append(
+                f"- 📧 {r.get('email', 'N/A')} | 🏆 {r.get('plan', 'N/A')} | 💳 {r.get('total_with_refresh', 0)} credits"
+            )
+        summary_message += "\n".join(summary_table)
+        summary_message += "\n\n"
+
+        # Create a summary.txt file
+        summary_file_path = os.path.join(OUTPUT_DIR, "summary.txt")
+        with open(summary_file_path, 'w', encoding='utf-8') as sf:
+            sf.write(summary_message)
+
     await update.message.reply_text(summary_message)
 
-    # Create a zip file of all validated cookies
+    # Create a zip file of all validated cookies and the summary.txt
     if valid_count > 0:
         output_zip_path = os.path.join(OUTPUT_DIR, "validated_cookies.zip")
         with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for root, _, files in os.walk(OUTPUT_DIR):
                 for file in files:
+                    # Only add .txt files (cookies and summary.txt)
                     if file.endswith('.txt'):
-                        zf.write(os.path.join(root, file), os.path.basename(file))
+                        zf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), OUTPUT_DIR))
         
         await update.message.reply_document(document=open(output_zip_path, 'rb'))
         os.remove(output_zip_path) # Clean up the output zip file
+        if os.path.exists(summary_file_path):
+            os.remove(summary_file_path) # Clean up the summary.txt file
 
     # Clean up input cookie files
     for f in file_paths:
