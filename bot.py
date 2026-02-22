@@ -1,4 +1,3 @@
-_START_OF_FILE_
 import os
 import json
 import time
