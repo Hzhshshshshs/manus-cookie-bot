@@ -1,4 +1,4 @@
-
+_START_OF_FILE_
 import os
 import json
 import time
@@ -9,8 +9,14 @@ import concurrent.futures
 import requests
 import zipfile
 from datetime import datetime
-from telegram import Update, File
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, File, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
+
+# Global dictionary to store user sorting preferences
+USER_SORT_PREFERENCES = {}
+
+# States for conversation handler
+SELECTING_SORT_OPTION = 0
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 # These will be set via environment variables in GitHub Actions
@@ -228,7 +234,8 @@ def validate_cookie_file(file_path):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Hi! Send me a .txt cookie file or a .zip archive containing multiple cookie files, "
-        "and I'll validate them for you."
+        "and I\'ll validate them for you.\n\n"\
+        "You can also use /sort to change how the results are ordered."
     )
 
 
@@ -285,6 +292,29 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
     invalid_count = sum(1 for r in results if r["status"] == "invalid")
     error_count = sum(1 for r in results if r["status"] == "error")
 
+    valid_results = [r for r in results if r["status"] == "valid"]
+    if valid_results:
+        # Apply user's sorting preference
+        user_id = update.effective_user.id
+        sort_preference = USER_SORT_PREFERENCES.get(user_id, "credits_desc") # Default to credits descending
+
+        if sort_preference == "plan_asc":
+            valid_results.sort(key=lambda x: x.get("plan", ""))
+        elif sort_preference == "plan_desc":
+            valid_results.sort(key=lambda x: x.get("plan", ""), reverse=True)
+        elif sort_preference == "credits_asc":
+            valid_results.sort(key=lambda x: x.get("total_with_refresh", 0))
+        elif sort_preference == "credits_desc":
+            valid_results.sort(key=lambda x: x.get("total_with_refresh", 0), reverse=True)
+        elif sort_preference == "email_asc":
+            valid_results.sort(key=lambda x: x.get("email", ""))
+        elif sort_preference == "email_desc":
+            valid_results.sort(key=lambda x: x.get("email", ""), reverse=True)
+        elif sort_preference == "renewal_asc":
+            valid_results.sort(key=lambda x: x.get("renewal_date", ""))
+        elif sort_preference == "renewal_desc":
+            valid_results.sort(key=lambda x: x.get("renewal_date", ""), reverse=True)
+
     summary_message = (
         f"✨ Validation complete! ✨\n\n"
         f"✅ Valid:   {valid_count}\n"
@@ -292,11 +322,7 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
         f"⚠️ Errors:  {error_count}\n\n"
     )
 
-    valid_results = [r for r in results if r["status"] == "valid"]
     if valid_results:
-        # Sort valid results by plan and then by total_with_refresh credits (descending)
-        valid_results.sort(key=lambda x: (x.get("plan", ""), x.get("total_with_refresh", 0)), reverse=True)
-
         summary_message += "--- Valid Cookies Details ---\n"
         summary_table = []
         for r in valid_results:
@@ -332,10 +358,48 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
     for f in file_paths:
         os.remove(f)
 
+async def sort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    keyboard = [
+        [InlineKeyboardButton("Plan (A-Z)", callback_data="plan_asc"),
+         InlineKeyboardButton("Plan (Z-A)", callback_data="plan_desc")],
+        [InlineKeyboardButton("Credits (Low-High)", callback_data="credits_asc"),
+         InlineKeyboardButton("Credits (High-Low)", callback_data="credits_desc")],
+        [InlineKeyboardButton("Email (A-Z)", callback_data="email_asc"),
+         InlineKeyboardButton("Email (Z-A)", callback_data="email_desc")],
+        [InlineKeyboardButton("Renewal (Soonest-Latest)", callback_data="renewal_asc"),
+         InlineKeyboardButton("Renewal (Latest-Soonest)", callback_data="renewal_desc")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Select sorting preference:", reply_markup=reply_markup)
+    return SELECTING_SORT_OPTION
+
+async def select_sort_option(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    sort_preference = query.data
+
+    if sort_preference == "cancel":
+        await query.edit_message_text("Sorting preference selection cancelled.")
+    else:
+        user_id = update.effective_user.id
+        USER_SORT_PREFERENCES[user_id] = sort_preference
+        await query.edit_message_text(f"Sorting preference set to: {sort_preference.replace('_', ' ').title()}")
+    return ConversationHandler.END
+
 def main() -> None:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("sort", sort_command)],
+        states={
+            SELECTING_SORT_OPTION: [CallbackQueryHandler(select_sort_option)],
+        },
+        fallbacks=[CommandHandler("cancel", select_sort_option)],
+    )
+
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(conv_handler)
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -343,3 +407,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+_END_OF_FILE_
