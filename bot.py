@@ -10,6 +10,7 @@ import zipfile
 from datetime import datetime
 from telegram import Update, File, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
+from collections import Counter
 
 # Global dictionary to store user sorting preferences
 USER_SORT_PREFERENCES = {}
@@ -42,6 +43,7 @@ PLAN_MAP = {
     'team': 'Team',
     'casual': 'Casual',
 }
+
 
 
 def parse_netscape_cookies(file_path):
@@ -233,7 +235,7 @@ def validate_cookie_file(file_path):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Hi! Send me a .txt cookie file or a .zip archive containing multiple cookie files, "
-        "and I\'ll validate them for you.\n\n"\
+        "and I'll validate them for you.\n\n"
         "You can also use /sort to change how the results are ordered."
     )
 
@@ -244,28 +246,34 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if file_name.endswith('.txt'):
         await update.message.reply_text(f"Received single cookie file: {file_name}. Validating...")
-        new_file: File = await context.bot.get_file(document.file_id)
-        file_path = os.path.join(COOKIES_DIR, file_name)
-        await new_file.download_to_drive(file_path)
-        await process_cookie_files(update, context, [file_path])
+        try:
+            new_file: File = await context.bot.get_file(document.file_id)
+            file_path = os.path.join(COOKIES_DIR, file_name)
+            await new_file.download_to_drive(file_path)
+            await process_cookie_files(update, context, [file_path])
+        except Exception as e:
+            await update.message.reply_text(f"Error processing file: {e}")
 
     elif file_name.endswith('.zip'):
         await update.message.reply_text(f"Received zip archive: {file_name}. Extracting and validating...")
-        new_file: File = await context.bot.get_file(document.file_id)
-        zip_path = os.path.join(COOKIES_DIR, file_name)
-        await new_file.download_to_drive(zip_path)
+        try:
+            new_file: File = await context.bot.get_file(document.file_id)
+            zip_path = os.path.join(COOKIES_DIR, file_name)
+            await new_file.download_to_drive(zip_path)
 
-        extracted_files = []
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            for member in zip_ref.namelist():
-                if member.endswith('.txt'):
-                    extracted_path = os.path.join(COOKIES_DIR, os.path.basename(member))
-                    with open(extracted_path, "wb") as output_file:
-                        with zip_ref.open(member) as input_file:
-                            output_file.write(input_file.read())
-                    extracted_files.append(extracted_path)
-        os.remove(zip_path) # Clean up the zip file
-        await process_cookie_files(update, context, extracted_files)
+            extracted_files = []
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                for member in zip_ref.namelist():
+                    if member.endswith('.txt'):
+                        extracted_path = os.path.join(COOKIES_DIR, os.path.basename(member))
+                        with open(extracted_path, "wb") as output_file:
+                            with zip_ref.open(member) as input_file:
+                                output_file.write(input_file.read())
+                        extracted_files.append(extracted_path)
+            os.remove(zip_path)  # Clean up the zip file
+            await process_cookie_files(update, context, extracted_files)
+        except Exception as e:
+            await update.message.reply_text(f"Error processing zip file: {e}")
 
     else:
         await update.message.reply_text(
@@ -283,9 +291,18 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_file = {executor.submit(validate_cookie_file, f): f for f in file_paths}
         for future in concurrent.futures.as_completed(future_to_file):
-            res = future.result()
-            if res:
-                results.append(res)
+            try:
+                res = future.result()
+                if res:
+                    results.append(res)
+            except Exception as e:
+                file_path = future_to_file[future]
+                print(f"  Unexpected error processing {file_path}: {e}")
+                results.append({
+                    "file": os.path.basename(file_path),
+                    "status": "error",
+                    "message": str(e)
+                })
 
     valid_count = sum(1 for r in results if r["status"] == "valid")
     invalid_count = sum(1 for r in results if r["status"] == "invalid")
@@ -295,7 +312,7 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
     if valid_results:
         # Apply user's sorting preference
         user_id = update.effective_user.id
-        sort_preference = USER_SORT_PREFERENCES.get(user_id, "credits_desc") # Default to credits descending
+        sort_preference = USER_SORT_PREFERENCES.get(user_id, "credits_desc")  # Default to credits descending
 
         if sort_preference == "plan_asc":
             valid_results.sort(key=lambda x: x.get("plan", ""))
@@ -314,29 +331,83 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
         elif sort_preference == "renewal_desc":
             valid_results.sort(key=lambda x: x.get("renewal_date", ""), reverse=True)
 
+    # ── Build compact Telegram summary (counts by plan) ──
+    plan_counts = Counter(r.get('plan', 'Unknown') for r in valid_results)
+    total_credits_all = sum(r.get('total_with_refresh', 0) for r in valid_results)
+
     summary_message = (
         f"✨ Validation complete! ✨\n\n"
-        f"✅ Valid:   {valid_count}\n"
-        f"❌ Invalid: {invalid_count}\n"
-        f"⚠️ Errors:  {error_count}\n\n"
+        f"📊 Results:\n"
+        f"  ✅ Valid:   {valid_count}\n"
+        f"  ❌ Invalid: {invalid_count}\n"
+        f"  ⚠️ Errors:  {error_count}\n"
     )
 
     if valid_results:
-        summary_message += "--- Valid Cookies Details ---\n"
-        summary_table = []
-        for r in valid_results:
-            summary_table.append(
-                f"- 📧 {r.get('email', 'N/A')} | 🏆 {r.get('plan', 'N/A')} | 💳 {r.get('total_with_refresh', 0)} credits"
-            )
-        summary_message += "\n".join(summary_table)
-        summary_message += "\n\n"
+        summary_message += f"\n📋 Breakdown by Plan:\n"
+        # Sort plans in a logical order
+        plan_order = ['Max', 'Pro', 'Plus', 'Team', 'Casual', 'Free']
+        for plan_name in plan_order:
+            if plan_name in plan_counts:
+                summary_message += f"  🏆 {plan_name}: {plan_counts[plan_name]}\n"
+        # Include any plans not in the predefined order
+        for plan_name, count in sorted(plan_counts.items()):
+            if plan_name not in plan_order:
+                summary_message += f"  🏆 {plan_name}: {count}\n"
 
-        # Create a summary.txt file
-        summary_file_path = os.path.join(OUTPUT_DIR, "summary.txt")
-        with open(summary_file_path, 'w', encoding='utf-8') as sf:
-            sf.write(summary_message)
+        summary_message += f"\n💳 Total Credits: {total_credits_all}\n"
+        summary_message += f"\n📎 Full details are in the attached summary.txt"
 
     await update.message.reply_text(summary_message)
+
+    # ── Build detailed summary.txt for the zip ──
+    if valid_results:
+        detailed_lines = []
+        detailed_lines.append("=" * 60)
+        detailed_lines.append("       COOKIE VALIDATION REPORT")
+        detailed_lines.append("=" * 60)
+        detailed_lines.append(f"")
+        detailed_lines.append(f"Total Checked:  {len(results)}")
+        detailed_lines.append(f"Valid:          {valid_count}")
+        detailed_lines.append(f"Invalid:        {invalid_count}")
+        detailed_lines.append(f"Errors:         {error_count}")
+        detailed_lines.append(f"")
+        detailed_lines.append("-" * 60)
+        detailed_lines.append("BREAKDOWN BY PLAN")
+        detailed_lines.append("-" * 60)
+        for plan_name in plan_order:
+            if plan_name in plan_counts:
+                detailed_lines.append(f"  {plan_name}: {plan_counts[plan_name]}")
+        for plan_name, count in sorted(plan_counts.items()):
+            if plan_name not in plan_order:
+                detailed_lines.append(f"  {plan_name}: {count}")
+        detailed_lines.append(f"")
+        detailed_lines.append(f"Total Credits: {total_credits_all}")
+        detailed_lines.append(f"")
+        detailed_lines.append("-" * 60)
+        detailed_lines.append("VALID COOKIES DETAILS")
+        detailed_lines.append("-" * 60)
+        for i, r in enumerate(valid_results, 1):
+            detailed_lines.append(f"")
+            detailed_lines.append(f"  [{i}] {r.get('email', 'N/A')}")
+            detailed_lines.append(f"      Plan:            {r.get('plan', 'N/A')}")
+            detailed_lines.append(f"      Billing:         {r.get('billing', 'N/A')}")
+            detailed_lines.append(f"      Credits:         {r.get('total_with_refresh', 0)}")
+            detailed_lines.append(f"      Monthly Limit:   {r.get('monthly_credits_limit', 0)}")
+            detailed_lines.append(f"      Daily Refresh:   {r.get('daily_refresh_credits', 0)}")
+            detailed_lines.append(f"      Max Refresh:     {r.get('max_refresh_credits', 0)}")
+            detailed_lines.append(f"      Free Credits:    {r.get('free_credits', 0)}")
+            detailed_lines.append(f"      Periodic:        {r.get('periodic_credits', 0)}")
+            detailed_lines.append(f"      Add-on:          {r.get('addon_credits', 0)}")
+            detailed_lines.append(f"      Renewal:         {r.get('renewal_date', 'N/A')}")
+            detailed_lines.append(f"      Name:            {r.get('name', 'N/A')}")
+            detailed_lines.append(f"      Output File:     {r.get('output_file', 'N/A')}")
+        detailed_lines.append(f"")
+        detailed_lines.append("=" * 60)
+
+        summary_file_path = os.path.join(OUTPUT_DIR, "summary.txt")
+        with open(summary_file_path, 'w', encoding='utf-8') as sf:
+            sf.write("\n".join(detailed_lines) + "\n")
 
     # Create a zip file of all validated cookies and the summary.txt
     if valid_count > 0:
@@ -347,15 +418,18 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
                     # Only add .txt files (cookies and summary.txt)
                     if file.endswith('.txt'):
                         zf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), OUTPUT_DIR))
-        
+
         await update.message.reply_document(document=open(output_zip_path, 'rb'))
-        os.remove(output_zip_path) # Clean up the output zip file
+        os.remove(output_zip_path)  # Clean up the output zip file
+        summary_file_path = os.path.join(OUTPUT_DIR, "summary.txt")
         if os.path.exists(summary_file_path):
-            os.remove(summary_file_path) # Clean up the summary.txt file
+            os.remove(summary_file_path)  # Clean up the summary.txt file
 
     # Clean up input cookie files
     for f in file_paths:
-        os.remove(f)
+        if os.path.exists(f):
+            os.remove(f)
+
 
 async def sort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = [
@@ -373,6 +447,7 @@ async def sort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await update.message.reply_text("Select sorting preference:", reply_markup=reply_markup)
     return SELECTING_SORT_OPTION
 
+
 async def select_sort_option(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -385,6 +460,7 @@ async def select_sort_option(update: Update, context: ContextTypes.DEFAULT_TYPE)
         USER_SORT_PREFERENCES[user_id] = sort_preference
         await query.edit_message_text(f"Sorting preference set to: {sort_preference.replace('_', ' ').title()}")
     return ConversationHandler.END
+
 
 def main() -> None:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -406,4 +482,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-_END_OF_FILE_
