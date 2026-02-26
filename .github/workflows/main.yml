@@ -1,14 +1,14 @@
-name: Manus Cookie Bot
+name: Manus Cookie Bot - Auto Restart Every 6h
 
 on:
   schedule:
-    - cron: '0 */6 * * *'      # Every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
-  workflow_dispatch:           # ← Click "Run workflow" for instant jump start
+    - cron: '0 */6 * * *'      # every 6 hours
+  workflow_dispatch:           # manual jump start button
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355         # Safe under GitHub 6-hour limit
+    timeout-minutes: 355
 
     steps:
       - name: Checkout code
@@ -24,15 +24,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install python-telegram-bot requests
 
-      - name: Create cookie folders
+      - name: Create folders
         run: mkdir -p manus_cookies_input manus_cookies_output
 
-      - name: 🚀 Jump Start Manus Cookie Bot
+      - name: 🔍 Check Token & Jump Start Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
+          echo "=== DEBUG START ==="
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "❌ CRITICAL ERROR: TELEGRAM_BOT_TOKEN is missing or empty!"
+            echo "   → Go to Settings → Secrets and variables → Actions"
+            echo "   → Add secret named exactly: TELEGRAM_BOT_TOKEN"
+            exit 1
+          fi
+          echo "✅ Token is set (length: ${#TELEGRAM_BOT_TOKEN})"
+
           echo "=== Starting Manus Cookie Bot @ $(date) ==="
-          echo "Bot will run for ~5h 50m then auto-restart via schedule"
-          timeout 5h 50m python -u bot.py || true
-          echo "=== Bot run finished @ $(date) ==="
-          echo "Next run scheduled in ~6 hours"
+          echo "It will run for ~5h 50m then auto-restart via schedule"
+          timeout 5h 50m python -u bot.py
+          echo "=== Bot finished @ $(date) ==="
