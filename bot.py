@@ -7,7 +7,7 @@ import base64
 import concurrent.futures
 import requests
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from telegram import Update, File, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 from collections import Counter
@@ -79,6 +79,71 @@ def decode_jwt(token):
     return {}
 
 
+def get_token_time_details(jwt_data):
+    """Extract and compute detailed token time information from JWT payload.
+
+    Returns a dict with:
+        - token_issued_at: formatted iat datetime string (UTC)
+        - token_expires_at: formatted exp datetime string (UTC)
+        - current_time: formatted current datetime string (UTC)
+        - time_remaining: human-readable time remaining until expiration
+        - total_validity_days: total validity period in days
+        - is_expired: boolean indicating if the token has expired
+        - iat_timestamp: raw iat value
+        - exp_timestamp: raw exp value
+    """
+    result = {
+        "token_issued_at": "N/A",
+        "token_expires_at": "N/A",
+        "current_time": "N/A",
+        "time_remaining": "N/A",
+        "total_validity_days": "N/A",
+        "is_expired": False,
+        "iat_timestamp": None,
+        "exp_timestamp": None,
+    }
+
+    iat = jwt_data.get('iat')
+    exp = jwt_data.get('exp')
+    now = datetime.now(timezone.utc)
+    result["current_time"] = now.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    if iat:
+        result["iat_timestamp"] = iat
+        iat_dt = datetime.fromtimestamp(iat, tz=timezone.utc)
+        result["token_issued_at"] = iat_dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    if exp:
+        result["exp_timestamp"] = exp
+        exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc)
+        result["token_expires_at"] = exp_dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+        # Calculate time remaining
+        remaining = exp_dt - now
+        if remaining.total_seconds() <= 0:
+            result["time_remaining"] = "EXPIRED"
+            result["is_expired"] = True
+        else:
+            days = remaining.days
+            hours, remainder = divmod(remaining.seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            parts = []
+            if days > 0:
+                parts.append(f"{days} day{'s' if days != 1 else ''}")
+            if hours > 0:
+                parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+            if minutes > 0:
+                parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+            result["time_remaining"] = ", ".join(parts) if parts else "Less than 1 minute"
+
+    if iat and exp:
+        total_seconds = exp - iat
+        total_days = total_seconds / 86400  # 86400 seconds in a day
+        result["total_validity_days"] = f"{total_days:.0f} days"
+
+    return result
+
+
 def call_api(url, headers):
     """Make a single API call and return (status_code, json_or_none)."""
     try:
@@ -106,6 +171,9 @@ def validate_cookie_file(file_path):
     jwt_data = decode_jwt(session_id)
     jwt_email = jwt_data.get('email', '')
     jwt_name = jwt_data.get('name', '')
+
+    # Extract token time details
+    token_time = get_token_time_details(jwt_data)
 
     headers = {
         'Content-Type': 'application/json',
@@ -157,7 +225,7 @@ def validate_cookie_file(file_path):
             )
             if period_end:
                 try:
-                    dt = datetime.utcfromtimestamp(int(period_end))
+                    dt = datetime.fromtimestamp(int(period_end), tz=timezone.utc)
                     renewal_date = dt.strftime('%b %d, %Y')
                 except Exception:
                     renewal_date = str(period_end)
@@ -215,7 +283,20 @@ def validate_cookie_file(file_path):
                 "renewal_date": renewal_date,
                 "subscription_status": user_data.get('subscriptionStatus', ''),
                 "payment_platform": user_data.get('paymentPlatform', ''),
-                "output_file": new_filename
+                "output_file": new_filename,
+                # Token time details
+                "token_issued_at": token_time["token_issued_at"],
+                "token_expires_at": token_time["token_expires_at"],
+                "token_checked_at": token_time["current_time"],
+                "token_time_remaining": token_time["time_remaining"],
+                "token_validity_period": token_time["total_validity_days"],
+                "token_is_expired": token_time["is_expired"],
+                # JWT payload fields for detailed view
+                "jwt_user_id": jwt_data.get('user_id', ''),
+                "jwt_type": jwt_data.get('type', ''),
+                "jwt_jti": jwt_data.get('jti', ''),
+                "jwt_team_uid": jwt_data.get('team_uid', ''),
+                "jwt_original_user_id": jwt_data.get('original_user_id', ''),
             }
 
             print(f"  OK: {filename} -> {plan} | {billing} | {total_with_refresh} credits | {email}")
@@ -356,6 +437,15 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
                 summary_message += f"  🏆 {plan_name}: {count}\n"
 
         summary_message += f"\n💳 Total Credits: {total_credits_all}\n"
+
+        # Count expiring soon (within 7 days) and expired tokens
+        expiring_soon = sum(1 for r in valid_results if not r.get("token_is_expired", False) and _is_expiring_soon(r, 7))
+        expired_tokens = sum(1 for r in valid_results if r.get("token_is_expired", False))
+        if expired_tokens > 0:
+            summary_message += f"🔴 Expired Tokens: {expired_tokens}\n"
+        if expiring_soon > 0:
+            summary_message += f"🟡 Expiring Soon (≤7 days): {expiring_soon}\n"
+
         summary_message += f"\n📎 Full details are in the attached summary.txt"
 
     await update.message.reply_text(summary_message)
@@ -388,8 +478,16 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
         detailed_lines.append("VALID COOKIES DETAILS")
         detailed_lines.append("-" * 60)
         for i, r in enumerate(valid_results, 1):
+            # Determine token status indicator
+            if r.get("token_is_expired", False):
+                token_status = "🔴 EXPIRED"
+            elif _is_expiring_soon(r, 7):
+                token_status = "🟡 EXPIRING SOON"
+            else:
+                token_status = "🟢 ACTIVE"
+
             detailed_lines.append(f"")
-            detailed_lines.append(f"  [{i}] {r.get('email', 'N/A')}")
+            detailed_lines.append(f"  [{i}] {r.get('email', 'N/A')}  {token_status}")
             detailed_lines.append(f"      Plan:            {r.get('plan', 'N/A')}")
             detailed_lines.append(f"      Billing:         {r.get('billing', 'N/A')}")
             detailed_lines.append(f"      Credits:         {r.get('total_with_refresh', 0)}")
@@ -402,6 +500,22 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
             detailed_lines.append(f"      Renewal:         {r.get('renewal_date', 'N/A')}")
             detailed_lines.append(f"      Name:            {r.get('name', 'N/A')}")
             detailed_lines.append(f"      Output File:     {r.get('output_file', 'N/A')}")
+            detailed_lines.append(f"")
+            detailed_lines.append(f"      ── Cookie Token Time Details ──")
+            detailed_lines.append(f"      ⏰ Token Issued At:     {r.get('token_issued_at', 'N/A')}")
+            detailed_lines.append(f"      ⏰ Token Expires At:    {r.get('token_expires_at', 'N/A')}")
+            detailed_lines.append(f"      📅 Checked At:          {r.get('token_checked_at', 'N/A')}")
+            detailed_lines.append(f"      ⏳ Time Remaining:      {r.get('token_time_remaining', 'N/A')}")
+            detailed_lines.append(f"      📊 Validity Period:     {r.get('token_validity_period', 'N/A')}")
+            detailed_lines.append(f"")
+            detailed_lines.append(f"      ── Decoded JWT Payload ──")
+            detailed_lines.append(f"      User ID:              {r.get('jwt_user_id', 'N/A')}")
+            detailed_lines.append(f"      Type:                 {r.get('jwt_type', 'N/A')}")
+            detailed_lines.append(f"      JTI:                  {r.get('jwt_jti', 'N/A')}")
+            if r.get('jwt_team_uid'):
+                detailed_lines.append(f"      Team UID:             {r.get('jwt_team_uid')}")
+            if r.get('jwt_original_user_id'):
+                detailed_lines.append(f"      Original User ID:     {r.get('jwt_original_user_id')}")
         detailed_lines.append(f"")
         detailed_lines.append("=" * 60)
 
@@ -429,6 +543,23 @@ async def process_cookie_files(update: Update, context: ContextTypes.DEFAULT_TYP
     for f in file_paths:
         if os.path.exists(f):
             os.remove(f)
+
+
+def _is_expiring_soon(result, days_threshold=7):
+    """Check if a token is expiring within the given number of days."""
+    time_remaining = result.get("token_time_remaining", "N/A")
+    if time_remaining in ("N/A", "EXPIRED"):
+        return False
+    # Parse the time remaining string to check if it's within threshold
+    # Format: "X days, Y hours, Z minutes" or "Y hours, Z minutes" or "Z minutes"
+    try:
+        total_days = 0
+        if "day" in time_remaining:
+            day_part = time_remaining.split("day")[0].strip().split(",")[-1].strip()
+            total_days = int(day_part)
+        return total_days < days_threshold
+    except (ValueError, IndexError):
+        return False
 
 
 async def sort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
