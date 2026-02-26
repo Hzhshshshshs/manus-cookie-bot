@@ -1,0 +1,38 @@
+name: Manus Cookie Bot
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'      # Every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
+  workflow_dispatch:           # ← Click "Run workflow" for instant jump start
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355         # Safe under GitHub 6-hour limit
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-telegram-bot requests
+
+      - name: Create cookie folders
+        run: mkdir -p manus_cookies_input manus_cookies_output
+
+      - name: 🚀 Jump Start Manus Cookie Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          echo "=== Starting Manus Cookie Bot @ $(date) ==="
+          echo "Bot will run for ~5h 50m then auto-restart via schedule"
+          timeout 5h 50m python -u bot.py || true
+          echo "=== Bot run finished @ $(date) ==="
+          echo "Next run scheduled in ~6 hours"
