@@ -1,0 +1,90 @@
+name: Run Telegram Bot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Runs every 6 hours as a safety net to ensure the bot is always up
+    - cron: '0 */6 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max (GitHub Actions limit)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-telegram-bot requests
+
+      - name: Run bot with auto-restart
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          echo "=== Bot starting at $(date -u) ==="
+          echo "Bot will auto-restart before the 6-hour GitHub Actions limit."
+          echo ""
+
+          # Maximum runtime in seconds (5 hours 50 minutes = 21000 seconds)
+          # We stop 10 minutes early to allow clean shutdown and workflow re-trigger
+          MAX_RUNTIME=21000
+          START_TIME=$(date +%s)
+
+          while true; do
+            echo "[$(date -u)] Starting bot process..."
+            
+            # Run the bot in the background
+            python bot.py &
+            BOT_PID=$!
+            
+            # Monitor loop: check bot health and runtime
+            while true; do
+              sleep 30
+              
+              CURRENT_TIME=$(date +%s)
+              ELAPSED=$((CURRENT_TIME - START_TIME))
+              REMAINING=$((MAX_RUNTIME - ELAPSED))
+              
+              # Check if we're approaching the time limit
+              if [ $ELAPSED -ge $MAX_RUNTIME ]; then
+                echo ""
+                echo "[$(date -u)] Approaching 6-hour limit (ran for $((ELAPSED / 3600))h $(((ELAPSED % 3600) / 60))m)."
+                echo "Stopping bot for clean restart via next scheduled workflow run..."
+                kill $BOT_PID 2>/dev/null
+                wait $BOT_PID 2>/dev/null
+                
+                # Trigger a new workflow run using GitHub API
+                echo "Triggering new workflow run..."
+                curl -s -X POST \
+                  -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/${{ github.repository }}/actions/workflows/run-bot.yml/dispatches" \
+                  -d '{"ref":"main"}'
+                
+                echo "New workflow dispatched. This run is now exiting."
+                exit 0
+              fi
+              
+              # Check if bot process is still alive
+              if ! kill -0 $BOT_PID 2>/dev/null; then
+                echo "[$(date -u)] Bot process exited unexpectedly. Restarting in 10 seconds..."
+                sleep 10
+                break  # Break inner loop to restart bot
+              fi
+              
+              # Log status every 15 minutes
+              if [ $((ELAPSED % 900)) -lt 30 ]; then
+                echo "[$(date -u)] Bot running | Uptime: $((ELAPSED / 3600))h $(((ELAPSED % 3600) / 60))m | Time remaining: $((REMAINING / 3600))h $(((REMAINING % 3600) / 60))m"
+              fi
+            done
+          done
